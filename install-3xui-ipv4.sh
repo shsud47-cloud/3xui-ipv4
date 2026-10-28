@@ -81,6 +81,39 @@ rand_alnum() {
 
 is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
+# Reality dest is dialed by the inbound itself (not freedom outbound), so force A/IPv4.
+resolve_sni_ipv4() {
+  local host="$1" ip=""
+  if is_ipv4 "$host"; then
+    echo "$host"
+    return
+  fi
+  if command -v getent >/dev/null 2>&1; then
+    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+  fi
+  if ! is_ipv4 "${ip:-}"; then
+    ip=$(dig +short A "$host" 2>/dev/null | awk '/^[0-9]+\./{print; exit}')
+  fi
+  if ! is_ipv4 "${ip:-}"; then
+    ip=$(python3 - "$host" <<'PYDNS' 2>/dev/null || true
+import socket, sys
+host = sys.argv[1]
+try:
+    for info in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM):
+        print(info[4][0])
+        break
+except Exception:
+    pass
+PYDNS
+)
+  fi
+  if is_ipv4 "${ip:-}"; then
+    echo "$ip"
+  else
+    return 1
+  fi
+}
+
 detect_public_ipv4() {
   local ip="" u
   if [[ -n "$PUBLIC_IP" ]]; then
@@ -385,20 +418,25 @@ setup_reality() {
     fi
   fi
 
-  # xray x25519 output varies by version (Private/Public or PrivateKey/Password)
+  # xray 26.3.x: PrivateKey / Password (PublicKey); older: Private key / Public key
   local keyout
   keyout=$("$bin" x25519)
-  priv=$(printf '%s\n' "$keyout" | sed -n 's/.*[Pp]rivate[^:]*:[[:space:]]*//p' | head -1 | tr -d '\r')
-  pub=$(printf '%s\n' "$keyout" | sed -n 's/.*[Pp]ublic[^:]*:[[:space:]]*//p' | head -1 | tr -d '\r')
-  # Newer xray: "Password:" line is the public key used as pbk
-  local pwline
-  pwline=$(printf '%s\n' "$keyout" | sed -n 's/^Password:[[:space:]]*//p' | head -1 | tr -d '\r')
-  [[ -n "$pwline" ]] && pub="$pwline"
+  priv=$(printf '%s\n' "$keyout" | sed -n 's/^PrivateKey:[[:space:]]*//p; s/^Private key:[[:space:]]*//p' | head -1 | tr -d '\r')
+  pub=$(printf '%s\n' "$keyout" | sed -n 's/^Password (PublicKey):[[:space:]]*//p; s/^Password:[[:space:]]*//p; s/^Public key:[[:space:]]*//p; s/^PublicKey:[[:space:]]*//p' | head -1 | tr -d '\r')
   [[ -n "$priv" && -n "$pub" ]] || die "x25519 密钥生成失败:\n$keyout"
 
   uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || "$bin" uuid)
   sid=$(openssl rand -hex 4)
   subid=$(rand_alnum 16)
+
+  local dest_host dest_ip
+  dest_host="$SNI"
+  if dest_ip=$(resolve_sni_ipv4 "$SNI"); then
+    log "Reality dest 解析为 IPv4: ${dest_ip}:443（serverNames 仍用 ${SNI}）"
+    dest_host="$dest_ip"
+  else
+    warn "无法解析 ${SNI} 的 A 记录，dest 仍用域名（可能走 v6 失败）"
+  fi
 
   local settings stream sniffing
   settings=$(jq -nc \
@@ -408,7 +446,7 @@ setup_reality() {
     '{clients:[{id:$id,flow:"xtls-rprx-vision",email:$email,limitIp:0,totalGB:0,expiryTime:0,enable:true,tgId:"",subId:$sub,comment:"",reset:0}],decryption:"none",fallbacks:[]}')
 
   stream=$(jq -nc \
-    --arg dest "${SNI}:443" \
+    --arg dest "${dest_host}:443" \
     --arg sni "$SNI" \
     --arg priv "$priv" \
     --arg pub "$pub" \
@@ -424,7 +462,7 @@ INSERT INTO inbounds(
   listen, port, protocol, settings, stream_settings, tag, sniffing
 ) VALUES (
   1, 0, 0, 0, '${remark}', 1, 0,
-  '', ${REALITY_PORT}, 'vless',
+  '0.0.0.0', ${REALITY_PORT}, 'vless',
   '$(printf '%s' "$settings" | sed "s/'/''/g")',
   '$(printf '%s' "$stream" | sed "s/'/''/g")',
   '${tag}',
@@ -440,27 +478,27 @@ SQL
   local has_clients
   has_clients=$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='clients';")
   if [[ -n "$has_clients" ]]; then
-    sqlite3 "$db" <<SQL
-INSERT INTO clients(email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, comment, created_at, updated_at)
-VALUES(
-  '${CLIENT_EMAIL}',
-  '${subid}',
-  '${uuid}',
-  'xtls-rprx-vision',
-  1, 0, 0, 0, '',
-  CAST(strftime('%s','now') AS INTEGER)*1000,
-  CAST(strftime('%s','now') AS INTEGER)*1000
-);
-SQL
+    # Prefer full schema; fall back if optional columns missing
+    if ! sqlite3 "$db" "INSERT INTO clients(email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, comment, traffic_reset, created_at, updated_at)
+      VALUES('${CLIENT_EMAIL}','${subid}','${uuid}','xtls-rprx-vision',1,0,0,0,'','never',
+      CAST(strftime('%s','now') AS INTEGER)*1000, CAST(strftime('%s','now') AS INTEGER)*1000);" 2>/dev/null; then
+      sqlite3 "$db" "INSERT INTO clients(email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, comment, created_at, updated_at)
+        VALUES('${CLIENT_EMAIL}','${subid}','${uuid}','xtls-rprx-vision',1,0,0,0,'',
+        CAST(strftime('%s','now') AS INTEGER)*1000, CAST(strftime('%s','now') AS INTEGER)*1000);"
+    fi
     local client_id
     client_id=$(sqlite3 "$db" "SELECT id FROM clients WHERE email='${CLIENT_EMAIL}' ORDER BY id DESC LIMIT 1;")
-    if [[ -n "$client_id" ]]; then
-      local has_ci
-      has_ci=$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='client_inbounds';")
-      if [[ -n "$has_ci" ]]; then
-        sqlite3 "$db" "INSERT OR REPLACE INTO client_inbounds(client_id,inbound_id,flow_override,created_at)
-          VALUES(${client_id},${inbound_id},'',CAST(strftime('%s','now') AS INTEGER)*1000);"
-      fi
+    [[ -n "$client_id" ]] || die "写入 clients 表失败（3x-ui 会清空 settings.clients 导致节点不可用）"
+    local has_ci
+    has_ci=$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='client_inbounds';")
+    if [[ -n "$has_ci" ]]; then
+      # 3x-ui ListForInbound 用 flow_override 覆盖 clients.flow；空字符串会丢掉 Vision → 客户端超时
+      sqlite3 "$db" "INSERT OR REPLACE INTO client_inbounds(client_id,inbound_id,flow_override,created_at)
+        VALUES(${client_id},${inbound_id},'xtls-rprx-vision',CAST(strftime('%s','now') AS INTEGER)*1000);"
+      local fov
+      fov=$(sqlite3 "$db" "SELECT flow_override FROM client_inbounds WHERE client_id=${client_id} AND inbound_id=${inbound_id};")
+      [[ "$fov" == "xtls-rprx-vision" ]] || die "flow_override 写入失败（当前='$fov'），节点会超时"
+      log "clients#${client_id} ↔ inbound#${inbound_id} flow_override=xtls-rprx-vision"
     fi
   fi
 
@@ -501,7 +539,88 @@ restart_panel() {
   else
     /usr/local/x-ui/x-ui restart 2>/dev/null || true
   fi
-  sleep 2
+  sleep 3
+}
+
+# After panel restart: ensure pinned Xray sticks, Vision flow present, listen IPv4-only.
+verify_and_fix() {
+  local bin="/usr/local/x-ui/bin/$(xray_bin_name)"
+  local cfg="/usr/local/x-ui/bin/config.json"
+  local db="/etc/x-ui/x-ui.db"
+  local tag="in-${REALITY_PORT}-tcp"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "DRY-RUN: verify xray ${XRAY_VER} + Vision flow + 0.0.0.0:${REALITY_PORT}"
+    return
+  fi
+
+  # Re-pin if panel overwrote binary on start
+  local ver
+  ver=$("$bin" version 2>/dev/null | head -1 || true)
+  if [[ "$ver" != *"${XRAY_VER}"* ]]; then
+    warn "Xray 版本被面板改回（$ver），重新固定到 ${XRAY_VER}"
+    pin_xray
+    restart_panel
+  else
+    log "Xray 版本确认: ${ver}"
+  fi
+
+  # Ensure flow_override still Vision (panel may rewrite rows)
+  if [[ -f "$db" ]]; then
+    sqlite3 "$db" "UPDATE client_inbounds SET flow_override='xtls-rprx-vision'
+      WHERE inbound_id IN (SELECT id FROM inbounds WHERE tag='${tag}')
+        AND (flow_override IS NULL OR flow_override='');" 2>/dev/null || true
+    sqlite3 "$db" "UPDATE clients SET flow='xtls-rprx-vision'
+      WHERE id IN (SELECT client_id FROM client_inbounds
+        WHERE inbound_id IN (SELECT id FROM inbounds WHERE tag='${tag}'))
+        AND (flow IS NULL OR flow='');" 2>/dev/null || true
+    # Force listen IPv4
+    sqlite3 "$db" "UPDATE inbounds SET listen='0.0.0.0' WHERE tag='${tag}' AND (listen IS NULL OR listen='' OR listen='::');" 2>/dev/null || true
+  fi
+
+  # Restart once more if we fixed DB after first boot
+  restart_panel
+
+  # Validate generated config.json has Vision flow + no [::] listen on Reality port
+  if [[ -f "$cfg" ]]; then
+    python3 - "$cfg" "$REALITY_PORT" <<'PYCHK' || warn "config.json 校验未通过，请检查面板入站"
+import json, sys
+cfg, port = sys.argv[1], int(sys.argv[2])
+with open(cfg) as f:
+    data = json.load(f)
+found = False
+for ib in data.get("inbounds", []):
+    if ib.get("port") != port:
+        continue
+    found = True
+    listen = ib.get("listen") or ""
+    if listen in ("::", "[::]", "::0"):
+        print("LISTEN_V6", listen)
+        sys.exit(2)
+    clients = (ib.get("settings") or {}).get("clients") or []
+    if not clients:
+        print("NO_CLIENTS")
+        sys.exit(3)
+    flows = [c.get("flow") for c in clients]
+    if "xtls-rprx-vision" not in flows:
+        print("NO_VISION", flows)
+        sys.exit(4)
+    print("OK", listen or "0.0.0.0", len(clients))
+    break
+if not found:
+    print("NO_INBOUND")
+    sys.exit(5)
+PYCHK
+  fi
+
+  # Port must be listening on IPv4
+  if command -v ss >/dev/null 2>&1; then
+    if ss -lntp 2>/dev/null | grep -E "[:.]${REALITY_PORT} " | grep -q .; then
+      log "已监听 :${REALITY_PORT}"
+      ss -lntp 2>/dev/null | grep -E "[:.]${REALITY_PORT} " || true
+    else
+      warn "未看到 :${REALITY_PORT} 监听，xray/面板可能未起来"
+    fi
+  fi
 }
 
 print_result() {
@@ -564,6 +683,10 @@ EOF
   echo "${link}"
   echo
   echo "密钥已写入 /etc/x-ui/reality-ipv4.env（权限 600），请自行保管；本脚本只打印一次。"
+  echo
+  echo "【重要】若装在 Incus/LXC 容器里：宿主机必须把 ${port}（面板）和 ${REALITY_PORT}（节点）"
+  echo "  DNAT/proxy 进容器，否则外网必超时。22/8443 为系统保留口，不要占用。"
+  echo "  换伪装可用: bash $0 --skip-install --force --sni dl.google.com --public-ip ${ip}"
   echo "======================================"
 }
 
@@ -578,6 +701,7 @@ main() {
   apply_xray_template
   setup_reality
   restart_panel
+  verify_and_fix
   print_result
 }
 
