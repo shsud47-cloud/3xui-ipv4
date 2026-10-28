@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # One-click 3x-ui + VLESS Reality, IPv4-only (no IPv6).
-# Safe defaults for Dee Panel rental CTs: Reality port != 443/8443/22.
+# Safe defaults for Dee Panel rental CTs: forbid 22/8443; Reality MAY use 443.
 # Ports: interactive prompt via /dev/tty (curl|bash safe); env/flags = non-interactive override.
 # Downloads: curl -4 + retries + GitHub/jsDelivr/ghfast mirrors; ensure_dns if resolve broken.
 # Install one-liner (CDN, GitHub-backed): see README.
-# rev: 2026-10-28-stable-fetch
+# rev: 2026-10-28-reality-443
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -31,12 +31,12 @@ SKIP_INSTALL=0
 DRY_RUN=0
 FORCE=0
 
-# Incus / Dee Panel rental CT reserved (do not bind)
-RESERVED_PORTS=(22 443 8443)
+# System reserved on rental CTs (SSH / host proxy). Reality MAY bind 443.
+FORBIDDEN_PORTS=(22 8443)
 
-is_reserved_port() {
+is_forbidden_port() {
   local p="$1" r
-  for r in "${RESERVED_PORTS[@]}"; do
+  for r in "${FORBIDDEN_PORTS[@]}"; do
     [[ "$p" -eq "$r" ]] && return 0
   done
   return 1
@@ -51,7 +51,7 @@ Usage: $0 [options]
 
   --panel-port N     面板端口 (default: 2096; env PANEL_PORT；设了则不再询问)
   --reality-port N   Reality 入站端口 (default: 2087; env REALITY_PORT)
-                     禁止 22/443/8443（租用节点保留）
+                     禁止 22/8443；可用 443（推荐入站）
   --sni HOST         Reality 伪装目标 (default: ${SNI})
   --xray-ver VER     Xray 版本号，无 v 前缀 (default: ${XRAY_VER})
   --xui-tag TAG      3x-ui 发行标签 (default: ${XUI_TAG})
@@ -100,8 +100,8 @@ port_validate_msg() {
     echo "${label}超出范围 1-65535"
     return 1
   fi
-  if is_reserved_port "$p"; then
-    echo "${label}不能使用 ${p}（禁止: 22 / 443 / 8443）"
+  if is_forbidden_port "$p"; then
+    echo "${label}不能使用 ${p}（禁止: 22 / 8443；Reality 可用 443）"
     return 1
   fi
   return 0
@@ -146,7 +146,7 @@ prompt_ports_interactive() {
   {
     echo
     echo "======== 端口设置（直接回车 = 默认）========"
-    echo "禁止占用: 22 / 443 / 8443（租用节点保留）"
+    echo "禁止占用: 22 / 8443（SSH/宿主机保留）；Reality 可用 443"
     echo "=========================================="
   } >/dev/tty
 
@@ -907,7 +907,7 @@ print_result() {
 DRY-RUN 摘要
   公网 IPv4:     ${ip}
   面板端口:      ${PANEL_PORT}
-  Reality 端口:  ${REALITY_PORT}  (非 443)
+  Reality 端口:  ${REALITY_PORT}
   SNI:           ${SNI}
   Xray:          ${XRAY_VER}
   3x-ui:         ${XUI_TAG}
