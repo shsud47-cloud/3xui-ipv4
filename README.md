@@ -6,6 +6,12 @@
 curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/install-3xui-ipv4.sh | bash
 ```
 
+若 raw 仍是旧脚本（CDN 缓存），用：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/shsud47-cloud/3xui-ipv4@main/install-3xui-ipv4.sh | bash
+```
+
 指定公网 IP：
 
 ```bash
