@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-click 3x-ui + VLESS Reality, IPv4-only (no IPv6).
 # Safe defaults for Dee Panel rental CTs: Reality port != 443/8443.
+# rev: 2026-10-28-flowfix
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
