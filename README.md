@@ -2,18 +2,16 @@
 
 给租用容器用的非交互脚本：**全程 IPv4**，Xray 默认 `26.3.27`（兼容不完整指纹），Reality 默认高位端口 **2087**（禁止 443/8443）。
 
-仓库私有。容器里直接粘贴下面一键命令即可（从 SG 静态地址拉脚本，不依赖 GitHub raw）。
-
 ## 一键安装（root）
 
 ```bash
-curl -fsSL http://149.118.61.204/install-3xui-ipv4.sh | bash
+curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/install-3xui-ipv4.sh | bash
 ```
 
 不写 `--public-ip` 时会自动探测公网 IPv4。需要强制指定时：
 
 ```bash
-curl -fsSL http://149.118.61.204/install-3xui-ipv4.sh | bash -s -- --public-ip 1.2.3.4
+curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/install-3xui-ipv4.sh | bash -s -- --public-ip 1.2.3.4
 ```
 
 ## 默认
@@ -40,13 +38,3 @@ curl -fsSL http://149.118.61.204/install-3xui-ipv4.sh | bash -s -- --public-ip 1
 
 - 宿主机要把 **面板端口 + Reality 端口** DNAT/转发进容器（22/8443 留给节点）。
 - 不要给容器挂公网 IPv6 网卡。
-- 私有 raw.githubusercontent.com 需要 token，因此一键安装走 SG 静态 HTTP。
-
-## 从本仓库更新静态脚本
-
-维护者把新脚本拷到 SG West：
-
-```bash
-scp install-3xui-ipv4.sh ubuntu@149.118.61.204:/opt/static-scripts/
-# 再同步进 NPM html（见部署说明）
-```
