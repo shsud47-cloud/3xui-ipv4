@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-click 3x-ui + VLESS Reality, IPv4-only (no IPv6).
 # Safe defaults for Dee Panel rental CTs: Reality port != 443/8443.
-# rev: 2026-10-28-flowfix
+# rev: 2026-10-28-dblock
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -174,6 +174,62 @@ run_or_echo() {
   fi
 }
 
+
+# ---------- sqlite helpers (stop x-ui first; retry on SQLITE_BUSY) ----------
+stop_xui() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop x-ui 2>/dev/null || true
+  fi
+  /usr/local/x-ui/x-ui stop 2>/dev/null || true
+  # wait until panel releases /etc/x-ui/x-ui.db
+  local i
+  for i in $(seq 1 30); do
+    if ! pgrep -x x-ui >/dev/null 2>&1 && ! pgrep -f '/usr/local/x-ui/bin/xray' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  sleep 0.3
+}
+
+# Run sqlite3 with busy_timeout + retries. Stops x-ui before write attempts.
+# Usage: sqlite_write DB SQL...   OR  sqlite_write DB <<'SQL' ... SQL
+sqlite_write() {
+  local db="$1"; shift
+  local attempt out rc sql
+  stop_xui
+  if [[ $# -gt 0 ]]; then
+    sql="$*"
+  else
+    sql=$(cat)
+  fi
+  for attempt in 1 2 3 4 5 6 7 8; do
+    stop_xui
+    set +e
+    out=$(sqlite3 -cmd "PRAGMA busy_timeout=8000;" "$db" "$sql" 2>&1)
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      [[ -n "$out" ]] && printf '%s\n' "$out"
+      return 0
+    fi
+    if printf '%s' "$out" | grep -qiE 'database is locked|locked \(5\)|SQLITE_BUSY'; then
+      warn "sqlite busy (attempt ${attempt}/8)，停 x-ui 后重试…"
+      sleep $((attempt))
+      continue
+    fi
+    printf '%s\n' "$out" >&2
+    return "$rc"
+  done
+  die "sqlite 写入失败（database is locked）: $db"
+}
+
+# Read-only sqlite (no stop). Still sets busy_timeout.
+sqlite_read() {
+  local db="$1"; shift
+  sqlite3 -cmd "PRAGMA busy_timeout=5000;" "$db" "$@"
+}
+
 # ---------- step: disable IPv6 ----------
 disable_ipv6() {
   log "关闭 IPv6（sysctl 持久化 + gai 优先 IPv4）"
@@ -261,16 +317,31 @@ install_3xui() {
   /usr/local/x-ui/x-ui setting -port "$PANEL_PORT" -webBasePath "$PANEL_PATH" \
     -username "$user" -password "$pass" >/dev/null 2>&1 || true
   # Avoid panel/sub both binding PANEL_PORT (3x-ui default → crash loop)
+  # Must stop x-ui first — installer just started it and holds the DB lock.
+  stop_xui
   python3 - "$PANEL_PORT" <<'PYSUB' 2>/dev/null || true
-import sqlite3, sys
+import sqlite3, sys, time
 port = int(sys.argv[1])
-c = sqlite3.connect("/etc/x-ui/x-ui.db")
-for k, v in [("subEnable", "false"), ("subPort", str(port + 1)), ("subListen", "")]:
-    if c.execute("select 1 from settings where key=?", (k,)).fetchone():
-        c.execute("update settings set value=? where key=?", (v, k))
-    else:
-        c.execute("insert into settings(key,value) values(?,?)", (k, v))
-c.commit()
+db = "/etc/x-ui/x-ui.db"
+last = None
+for attempt in range(8):
+    try:
+        c = sqlite3.connect(db, timeout=8)
+        c.execute("PRAGMA busy_timeout=8000")
+        for k, v in [("subEnable", "false"), ("subPort", str(port + 1)), ("subListen", "")]:
+            if c.execute("select 1 from settings where key=?", (k,)).fetchone():
+                c.execute("update settings set value=? where key=?", (v, k))
+            else:
+                c.execute("insert into settings(key,value) values(?,?)", (k, v))
+        c.commit()
+        c.close()
+        last = None
+        break
+    except sqlite3.OperationalError as e:
+        last = e
+        time.sleep(attempt + 1)
+if last:
+    raise SystemExit(f"sub settings write failed: {last}")
 PYSUB
 }
 
@@ -296,6 +367,7 @@ pin_xray() {
   if [[ -f "$dest" ]]; then
     cp -a "$dest" "${dest}.bak-before-${XRAY_VER}" 2>/dev/null || true
   fi
+  stop_xui
   install -m 755 "${tmp}/xray" "$dest"
   # keep geo files if present in zip
   [[ -f "${tmp}/geoip.dat" ]] && cp -f "${tmp}/geoip.dat" /usr/local/x-ui/bin/ || true
@@ -385,8 +457,9 @@ apply_xray_template() {
   # escape for SQL: single quotes doubled
   local esc
   esc=$(printf '%s' "$XRAY_TEMPLATE" | sed "s/'/''/g")
-  sqlite3 "$db" "DELETE FROM settings WHERE key='xrayTemplateConfig';
-    INSERT INTO settings(key,value) VALUES('xrayTemplateConfig','${esc}');"
+  # Official installer leaves x-ui running → SQLITE_BUSY without stop
+  sqlite_write "$db" "DELETE FROM settings WHERE key='xrayTemplateConfig';
+INSERT INTO settings(key,value) VALUES('xrayTemplateConfig','${esc}');"
 }
 
 # ---------- Reality keys + inbound via sqlite (compatible with 3.x clients table) ----------
@@ -405,15 +478,16 @@ setup_reality() {
   [[ -x "$bin" ]] || die "找不到 xray: $bin"
   [[ -f "$db" ]] || die "找不到 $db"
 
-  existing=$(sqlite3 "$db" "SELECT id FROM inbounds WHERE port=${REALITY_PORT} OR tag='${tag}' LIMIT 1;" 2>/dev/null || true)
+  stop_xui
+  existing=$(sqlite_read "$db" "SELECT id FROM inbounds WHERE port=${REALITY_PORT} OR tag='${tag}' LIMIT 1;" 2>/dev/null || true)
   if [[ -n "$existing" ]]; then
     if [[ "$FORCE" -eq 1 ]]; then
       warn "覆盖已有入站 id=$existing（port/tag 冲突）"
       local cid
-      for cid in $(sqlite3 "$db" "SELECT client_id FROM client_inbounds WHERE inbound_id=${existing};" 2>/dev/null); do
-        sqlite3 "$db" "DELETE FROM client_inbounds WHERE client_id=${cid}; DELETE FROM clients WHERE id=${cid};" 2>/dev/null || true
+      for cid in $(sqlite_read "$db" "SELECT client_id FROM client_inbounds WHERE inbound_id=${existing};" 2>/dev/null); do
+        sqlite_write "$db" "DELETE FROM client_inbounds WHERE client_id=${cid}; DELETE FROM clients WHERE id=${cid};" 2>/dev/null || true
       done
-      sqlite3 "$db" "DELETE FROM client_traffics WHERE inbound_id=${existing}; DELETE FROM inbounds WHERE id=${existing};" 2>/dev/null || true
+      sqlite_write "$db" "DELETE FROM client_traffics WHERE inbound_id=${existing}; DELETE FROM inbounds WHERE id=${existing};" 2>/dev/null || true
     else
       die "已存在 port=${REALITY_PORT} 或 tag=${tag} 的入站（id=$existing）。加 --force 覆盖，或换 --reality-port"
     fi
@@ -457,7 +531,7 @@ setup_reality() {
   sniffing='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
 
   local remark="VLESS-Reality-${REALITY_PORT}"
-  sqlite3 "$db" <<SQL
+  sqlite_write "$db" <<SQL
 INSERT INTO inbounds(
   user_id, up, down, total, remark, enable, expiry_time,
   listen, port, protocol, settings, stream_settings, tag, sniffing
@@ -472,39 +546,39 @@ INSERT INTO inbounds(
 SQL
 
   local inbound_id
-  inbound_id=$(sqlite3 "$db" "SELECT id FROM inbounds WHERE tag='${tag}';")
+  inbound_id=$(sqlite_read "$db" "SELECT id FROM inbounds WHERE tag='${tag}';")
   [[ -n "$inbound_id" ]] || die "写入 inbounds 失败"
 
   # 3.x clients table + link
   local has_clients
-  has_clients=$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='clients';")
+  has_clients=$(sqlite_read "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='clients';")
   if [[ -n "$has_clients" ]]; then
     # Prefer full schema; fall back if optional columns missing
-    if ! sqlite3 "$db" "INSERT INTO clients(email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, comment, traffic_reset, created_at, updated_at)
+    if ! sqlite_write "$db" "INSERT INTO clients(email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, comment, traffic_reset, created_at, updated_at)
       VALUES('${CLIENT_EMAIL}','${subid}','${uuid}','xtls-rprx-vision',1,0,0,0,'','never',
       CAST(strftime('%s','now') AS INTEGER)*1000, CAST(strftime('%s','now') AS INTEGER)*1000);" 2>/dev/null; then
-      sqlite3 "$db" "INSERT INTO clients(email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, comment, created_at, updated_at)
+      sqlite_write "$db" "INSERT INTO clients(email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, comment, created_at, updated_at)
         VALUES('${CLIENT_EMAIL}','${subid}','${uuid}','xtls-rprx-vision',1,0,0,0,'',
         CAST(strftime('%s','now') AS INTEGER)*1000, CAST(strftime('%s','now') AS INTEGER)*1000);"
     fi
     local client_id
-    client_id=$(sqlite3 "$db" "SELECT id FROM clients WHERE email='${CLIENT_EMAIL}' ORDER BY id DESC LIMIT 1;")
+    client_id=$(sqlite_read "$db" "SELECT id FROM clients WHERE email='${CLIENT_EMAIL}' ORDER BY id DESC LIMIT 1;")
     [[ -n "$client_id" ]] || die "写入 clients 表失败（3x-ui 会清空 settings.clients 导致节点不可用）"
     local has_ci
-    has_ci=$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='client_inbounds';")
+    has_ci=$(sqlite_read "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='client_inbounds';")
     if [[ -n "$has_ci" ]]; then
       # 3x-ui ListForInbound 用 flow_override 覆盖 clients.flow；空字符串会丢掉 Vision → 客户端超时
-      sqlite3 "$db" "INSERT OR REPLACE INTO client_inbounds(client_id,inbound_id,flow_override,created_at)
+      sqlite_write "$db" "INSERT OR REPLACE INTO client_inbounds(client_id,inbound_id,flow_override,created_at)
         VALUES(${client_id},${inbound_id},'xtls-rprx-vision',CAST(strftime('%s','now') AS INTEGER)*1000);"
       local fov
-      fov=$(sqlite3 "$db" "SELECT flow_override FROM client_inbounds WHERE client_id=${client_id} AND inbound_id=${inbound_id};")
+      fov=$(sqlite_read "$db" "SELECT flow_override FROM client_inbounds WHERE client_id=${client_id} AND inbound_id=${inbound_id};")
       [[ "$fov" == "xtls-rprx-vision" ]] || die "flow_override 写入失败（当前='$fov'），节点会超时"
       log "clients#${client_id} ↔ inbound#${inbound_id} flow_override=xtls-rprx-vision"
     fi
   fi
 
   # client_traffics row (older + newer panels)
-  sqlite3 "$db" "INSERT OR IGNORE INTO client_traffics(inbound_id,enable,email,up,down,expiry_time,total,reset)
+  sqlite_write "$db" "INSERT OR IGNORE INTO client_traffics(inbound_id,enable,email,up,down,expiry_time,total,reset)
     VALUES(${inbound_id},1,'${CLIENT_EMAIL}',0,0,0,0,0);" 2>/dev/null || true
 
   # persist share facts for reprint
@@ -567,15 +641,16 @@ verify_and_fix() {
 
   # Ensure flow_override still Vision (panel may rewrite rows)
   if [[ -f "$db" ]]; then
-    sqlite3 "$db" "UPDATE client_inbounds SET flow_override='xtls-rprx-vision'
+    stop_xui
+    sqlite_write "$db" "UPDATE client_inbounds SET flow_override='xtls-rprx-vision'
       WHERE inbound_id IN (SELECT id FROM inbounds WHERE tag='${tag}')
         AND (flow_override IS NULL OR flow_override='');" 2>/dev/null || true
-    sqlite3 "$db" "UPDATE clients SET flow='xtls-rprx-vision'
+    sqlite_write "$db" "UPDATE clients SET flow='xtls-rprx-vision'
       WHERE id IN (SELECT client_id FROM client_inbounds
         WHERE inbound_id IN (SELECT id FROM inbounds WHERE tag='${tag}'))
         AND (flow IS NULL OR flow='');" 2>/dev/null || true
     # Force listen IPv4
-    sqlite3 "$db" "UPDATE inbounds SET listen='0.0.0.0' WHERE tag='${tag}' AND (listen IS NULL OR listen='' OR listen='::');" 2>/dev/null || true
+    sqlite_write "$db" "UPDATE inbounds SET listen='0.0.0.0' WHERE tag='${tag}' AND (listen IS NULL OR listen='' OR listen='::');" 2>/dev/null || true
   fi
 
   # Restart once more if we fixed DB after first boot
