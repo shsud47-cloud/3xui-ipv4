@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-click 3x-ui + VLESS Reality, IPv4-only (no IPv6).
-# Safe defaults for Dee Panel rental CTs: Reality port != 443/8443.
-# rev: 2026-10-28-cli-sqlite
+# Safe defaults for Dee Panel rental CTs: Reality port != 443/8443/22.
+# Ports: env PANEL_PORT/REALITY_PORT, or --panel-port / --reality-port (flags win).
+# rev: 2026-10-28-ports
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -10,24 +11,30 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 die()  { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 
 # ---------- defaults / flags ----------
-PANEL_PORT=2096
-REALITY_PORT=2087
-SNI="www.apple.com"
-XRAY_VER="26.3.27"
-XUI_TAG="v3.11.0"
-PANEL_PATH=""          # empty = random
-PUBLIC_IP=""           # empty = auto-detect IPv4
-CLIENT_EMAIL="tenant-reality"
+# Env works with: curl ... | PANEL_PORT=N REALITY_PORT=M bash
+# Flags override env when both are set.
+PANEL_PORT="${PANEL_PORT:-2096}"
+REALITY_PORT="${REALITY_PORT:-2087}"
+SNI="${SNI:-www.apple.com}"
+XRAY_VER="${XRAY_VER:-26.3.27}"
+XUI_TAG="${XUI_TAG:-v3.11.0}"
+PANEL_PATH="${PANEL_PATH:-}"          # empty = random
+PUBLIC_IP="${PUBLIC_IP:-}"           # empty = auto-detect IPv4
+CLIENT_EMAIL="${CLIENT_EMAIL:-tenant-reality}"
 SKIP_INSTALL=0
 DRY_RUN=0
 FORCE=0
+
+# Incus / Dee Panel rental CT reserved (do not bind)
+RESERVED_PORTS=(22 8443)
 
 usage() {
   cat <<EOF
 Usage: $0 [options]
 
-  --panel-port N     面板端口 (default: ${PANEL_PORT})
-  --reality-port N   Reality 入站端口 (default: ${REALITY_PORT}; 禁止 443/8443)
+  --panel-port N     面板端口 (default: ${PANEL_PORT}; env PANEL_PORT)
+  --reality-port N   Reality 入站端口 (default: ${REALITY_PORT}; env REALITY_PORT)
+                     禁止 22/443/8443（租用节点保留）
   --sni HOST         Reality 伪装目标 (default: ${SNI})
   --xray-ver VER     Xray 版本号，无 v 前缀 (default: ${XRAY_VER})
   --xui-tag TAG      3x-ui 发行标签 (default: ${XUI_TAG})
@@ -38,6 +45,9 @@ Usage: $0 [options]
   --force            已有同端口 Reality 时覆盖重建
   --dry-run          只打印将要执行的步骤，不改系统
   -h, --help         帮助
+
+环境变量（curl|bash 时写在管道右侧）: PANEL_PORT REALITY_PORT SNI XRAY_VER …
+例: curl -fsSL …/install-3xui-ipv4.sh | PANEL_PORT=12345 REALITY_PORT=23456 bash
 
 全程纯 IPv4：关 sysctl IPv6、gai 优先 v4、xray UseIPv4、链接只用 IPv4 字面量。
 EOF
@@ -64,10 +74,23 @@ done
 if [[ "$DRY_RUN" -ne 1 ]]; then
   [[ $EUID -eq 0 ]] || die "请用 root 运行"
 fi
-[[ "$PANEL_PORT" =~ ^[0-9]+$ ]] && (( PANEL_PORT >= 1 && PANEL_PORT <= 65535 )) || die "非法 panel-port"
-[[ "$REALITY_PORT" =~ ^[0-9]+$ ]] && (( REALITY_PORT >= 1 && REALITY_PORT <= 65535 )) || die "非法 reality-port"
+[[ "$PANEL_PORT" =~ ^[0-9]+$ ]] && (( PANEL_PORT >= 1 && PANEL_PORT <= 65535 )) || die "非法 panel-port: $PANEL_PORT"
+[[ "$REALITY_PORT" =~ ^[0-9]+$ ]] && (( REALITY_PORT >= 1 && REALITY_PORT <= 65535 )) || die "非法 reality-port: $REALITY_PORT"
+is_reserved_port() {
+  local p="$1" r
+  for r in "${RESERVED_PORTS[@]}"; do
+    [[ "$p" -eq "$r" ]] && return 0
+  done
+  return 1
+}
+if is_reserved_port "$PANEL_PORT"; then
+  die "面板端口 ${PANEL_PORT} 为系统保留（禁止: ${RESERVED_PORTS[*]}），请换其它端口（默认 2096）"
+fi
+if is_reserved_port "$REALITY_PORT"; then
+  die "Reality 端口 ${REALITY_PORT} 为系统保留（禁止: ${RESERVED_PORTS[*]}），请换其它端口（默认 2087）"
+fi
 [[ "$REALITY_PORT" -eq 443 ]] && die "Reality 端口禁止使用 443（直连高位端口；默认 2087）"
-[[ "$REALITY_PORT" -eq 8443 ]] && die "8443 为租用节点保留端口，请换其它端口（默认 2087）"
+[[ "$PANEL_PORT" -eq 443 ]] && die "面板端口不要用 443（默认 2096）"
 [[ "$PANEL_PORT" -eq "$REALITY_PORT" ]] && die "面板端口与 Reality 端口不能相同"
 [[ "$SNI" == *:* ]] && die "SNI 不要带端口，例如 www.apple.com"
 
