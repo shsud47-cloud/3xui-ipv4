@@ -2,12 +2,20 @@
 
 给租用容器用的脚本：**全程 IPv4**，Xray 默认 `26.3.27`（兼容不完整指纹），Reality 默认高位端口 **2087**（禁止 22/443/8443）。
 
+通过 **jsDelivr CDN** 拉取公开仓 `shsud47-cloud/3xui-ipv4`（GitHub 源），避免部分地区 / 容器 DNS 解析不了 `raw.githubusercontent.com`。
+
 ## 一键安装（root）
 
-命令不变。装的时候脚本会在终端里问你端口（直接回车 = 默认）：
+就这一条（`-4` 强制 IPv4）。装的时候脚本会在终端里问你端口（直接回车 = 默认）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/install-3xui-ipv4.sh | bash
+curl -4 -fsSL https://cdn.jsdelivr.net/gh/shsud47-cloud/3xui-ipv4@main/install-3xui-ipv4.sh | bash
+```
+
+若提示 `Could not resolve host`（容器 `resolv.conf` 坏了），先修好 DNS 再跑同一条：
+
+```bash
+rm -f /etc/resolv.conf; printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf
 ```
 
 会出现类似提示（经 `/dev/tty`，兼容 `curl|bash`）：
@@ -25,7 +33,7 @@ Reality端口 [2087]:
 不写 `--public-ip` 时会自动探测公网 IPv4。需要强制指定时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/install-3xui-ipv4.sh | bash -s -- --public-ip 1.2.3.4
+curl -4 -fsSL https://cdn.jsdelivr.net/gh/shsud47-cloud/3xui-ipv4@main/install-3xui-ipv4.sh | bash -s -- --public-ip 1.2.3.4
 ```
 
 ## 默认
@@ -37,6 +45,12 @@ curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/instal
 | SNI / dest | `www.apple.com` | 可改 `--sni` |
 | Xray | `26.3.27` | `--xray-ver` |
 | 3x-ui | `v3.11.0` | `--xui-tag` |
+
+## 脚本稳定性
+
+- 启动时若 DNS 不可用，会自动写入 `1.1.1.1` / `8.8.8.8`
+- 拉 3x-ui 官方安装包、Xray 二进制：`curl -4` + 每源 3 次重试 + jsDelivr / GitHub / ghfast 镜像回退
+- 失败时打印已尝试的 URL 和排查命令
 
 ## 常用参数
 

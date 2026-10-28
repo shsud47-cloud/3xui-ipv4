@@ -2,7 +2,9 @@
 # One-click 3x-ui + VLESS Reality, IPv4-only (no IPv6).
 # Safe defaults for Dee Panel rental CTs: Reality port != 443/8443/22.
 # Ports: interactive prompt via /dev/tty (curl|bash safe); env/flags = non-interactive override.
-# rev: 2026-10-28-ports-ask
+# Downloads: curl -4 + retries + GitHub/jsDelivr/ghfast mirrors; ensure_dns if resolve broken.
+# Install one-liner (CDN, GitHub-backed): see README.
+# rev: 2026-10-28-stable-fetch
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -294,6 +296,71 @@ run_or_echo() {
   fi
 }
 
+# ---------- DNS + resilient fetch (IPv4) ----------
+# Rental CTs sometimes have a dangling /etc/resolv.conf → systemd-resolved stub.
+# Without working DNS, even GitHub/jsDelivr one-liners fail with "Could not resolve host".
+ensure_dns() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "DRY-RUN: ensure_dns (skip)"
+    return 0
+  fi
+  local ok=0
+  if getent ahostsv4 github.com >/dev/null 2>&1 \
+    || getent ahostsv4 cdn.jsdelivr.net >/dev/null 2>&1 \
+    || getent ahostsv4 one.one.one.one >/dev/null 2>&1; then
+    ok=1
+  fi
+  # dangling resolv.conf symlink counts as broken
+  if [[ -L /etc/resolv.conf && ! -e /etc/resolv.conf ]]; then
+    ok=0
+  fi
+  if [[ "$ok" -eq 1 ]]; then
+    return 0
+  fi
+  warn "DNS 不可用（无法解析 GitHub/CDN），写入公共 DNS 1.1.1.1 / 8.8.8.8"
+  rm -f /etc/resolv.conf
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:3\n' >/etc/resolv.conf
+  if getent ahostsv4 github.com >/dev/null 2>&1 \
+    || getent ahostsv4 cdn.jsdelivr.net >/dev/null 2>&1; then
+    log "DNS 已恢复"
+    return 0
+  fi
+  die "DNS 仍不可用。请检查容器网络/resolv.conf，或手动: printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' >/etc/resolv.conf"
+}
+
+# fetch_file DEST URL [URL2 ...] — curl -4, retries per URL, then next mirror
+fetch_file() {
+  local dest="$1"; shift
+  local url attempt rc
+  [[ $# -gt 0 ]] || die "fetch_file: 缺少 URL"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "DRY-RUN: fetch_file $dest <- $*"
+    return 0
+  fi
+  rm -f "$dest"
+  for url in "$@"; do
+    for attempt in 1 2 3; do
+      echo "  · try ${attempt}/3  ${url}"
+      set +e
+      curl -4 -fL --retry 2 --retry-delay 1 --connect-timeout 15 --max-time 180 \
+        -A "3xui-ipv4-installer/1.0" -o "$dest" "$url" 2>/tmp/3xui-fetch.err
+      rc=$?
+      set -e
+      if [[ $rc -eq 0 && -s "$dest" ]]; then
+        return 0
+      fi
+      warn "下载失败 rc=${rc}（$(tr '\n' ' ' </tmp/3xui-fetch.err 2>/dev/null | head -c 160)）"
+      rm -f "$dest"
+      sleep "$attempt"
+    done
+  done
+  die "所有镜像均失败，无法下载: ${dest}
+已尝试:
+$(printf '  - %s\n' "$@")
+排查: getent ahostsv4 github.com; cat /etc/resolv.conf; curl -4 -I https://cdn.jsdelivr.net/"
+}
+
+
 
 # ---------- sqlite helpers (stop x-ui first; retry on SQLITE_BUSY) ----------
 stop_xui() {
@@ -435,9 +502,12 @@ install_3xui() {
   export XUI_USERNAME="$user"
   export XUI_PASSWORD="$pass"
   export XUI_ENABLE_FAIL2BAN=false
-  # Official installer; pin tag
-  curl -fsSL "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_TAG}/install.sh" \
-    -o /tmp/3xui-official-install.sh
+  # Official installer; pin tag. Prefer CDN / mirrors when raw.githubusercontent.com DNS fails.
+  log "拉取 3x-ui 官方 install.sh（多镜像）"
+  fetch_file /tmp/3xui-official-install.sh \
+    "https://cdn.jsdelivr.net/gh/MHSanaei/3x-ui@${XUI_TAG}/install.sh" \
+    "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_TAG}/install.sh" \
+    "https://ghfast.top/https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_TAG}/install.sh"
   bash /tmp/3xui-official-install.sh "$XUI_TAG"
   # ensure listen on IPv4 only if setting exists
   /usr/local/x-ui/x-ui setting -listenIP "0.0.0.0" >/dev/null 2>&1 || true
@@ -481,13 +551,13 @@ pin_xray() {
   tmp=$(mktemp -d)
   log "降级/固定 Xray 到 ${XRAY_VER} → ${dest}"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "DRY-RUN: download https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/${zip}"
+    echo "DRY-RUN: download Xray v${XRAY_VER}/${zip} (github + mirrors)"
     rm -rf "$tmp"
     return
   fi
-  curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
-    -o "${tmp}/${zip}" \
-    "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/${zip}"
+  fetch_file "${tmp}/${zip}" \
+    "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/${zip}" \
+    "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/${zip}"
   unzip -qo "${tmp}/${zip}" -d "$tmp"
   [[ -x "${tmp}/xray" ]] || die "解压后未找到 xray 二进制"
   mkdir -p /usr/local/x-ui/bin
@@ -899,6 +969,7 @@ EOF
 main() {
   log "3x-ui IPv4 Reality 一键安装"
   echo "  panel=${PANEL_PORT}  reality=${REALITY_PORT}  sni=${SNI}  xray=${XRAY_VER}  dry_run=${DRY_RUN}"
+  ensure_dns
   disable_ipv6
   ensure_deps
   install_3xui
