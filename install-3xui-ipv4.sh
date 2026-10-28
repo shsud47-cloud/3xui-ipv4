@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-click 3x-ui + VLESS Reality, IPv4-only (no IPv6).
 # Safe defaults for Dee Panel rental CTs: Reality port != 443/8443.
-# rev: 2026-10-28-dblock
+# rev: 2026-10-28-cli-sqlite
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -177,10 +177,13 @@ run_or_echo() {
 
 # ---------- sqlite helpers (stop x-ui first; retry on SQLITE_BUSY) ----------
 stop_xui() {
+  # 3x-ui 3.11.x has no "stop"/"restart" subcommands (prints "Invalid subcommands").
+  # Prefer systemd/OpenRC; never call bare `x-ui stop`.
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop x-ui 2>/dev/null || true
+  elif command -v rc-service >/dev/null 2>&1; then
+    rc-service x-ui stop 2>/dev/null || true
   fi
-  /usr/local/x-ui/x-ui stop 2>/dev/null || true
   # wait until panel releases /etc/x-ui/x-ui.db
   local i
   for i in $(seq 1 30); do
@@ -206,7 +209,8 @@ sqlite_write() {
   for attempt in 1 2 3 4 5 6 7 8; do
     stop_xui
     set +e
-    out=$(sqlite3 -cmd "PRAGMA busy_timeout=8000;" "$db" "$sql" 2>&1)
+    # .timeout does not print a value (unlike PRAGMA busy_timeout=N which echoes N)
+    out=$(sqlite3 -cmd ".timeout 8000" "$db" "$sql" 2>&1)
     rc=$?
     set -e
     if [[ $rc -eq 0 ]]; then
@@ -227,7 +231,10 @@ sqlite_write() {
 # Read-only sqlite (no stop). Still sets busy_timeout.
 sqlite_read() {
   local db="$1"; shift
-  sqlite3 -cmd "PRAGMA busy_timeout=5000;" "$db" "$@"
+  # IMPORTANT: do NOT use `PRAGMA busy_timeout=N` via -cmd — sqlite3 prints N and
+  # pollutes command substitutions (e.g. inbound_id becomes "5000\n1", or bare "5000"
+  # is mistaken for an existing inbound id and aborts setup without --force).
+  sqlite3 -cmd ".timeout 5000" "$db" "$@"
 }
 
 # ---------- step: disable IPv6 ----------
@@ -612,7 +619,9 @@ restart_panel() {
   elif command -v rc-service >/dev/null 2>&1; then
     rc-service x-ui restart
   else
-    /usr/local/x-ui/x-ui restart 2>/dev/null || true
+    # 3.11.x: no "restart" subcommand — start via systemd unit ExecStart=x-ui run
+    /usr/local/x-ui/x-ui run >/dev/null 2>&1 &
+    sleep 1
   fi
   sleep 3
 }

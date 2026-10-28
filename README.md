@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/instal
 curl -fsSL https://raw.githubusercontent.com/shsud47-cloud/3xui-ipv4/main/install-3xui-ipv4.sh | bash -s -- --public-ip 1.2.3.4
 ```
 
-GitHub raw 有缓存时可用 jsDelivr：
+raw 有缓存时可用：
 
 ```bash
 curl -fsSL https://cdn.jsdelivr.net/gh/shsud47-cloud/3xui-ipv4@main/install-3xui-ipv4.sh | bash
@@ -43,7 +43,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/shsud47-cloud/3xui-ipv4@main/install-3xui
 ## 注意
 
 - 装在 Incus/LXC 容器里时，宿主机必须把面板口和 Reality 口 DNAT/proxy 进容器；**22 / 8443 系统保留，不要占用**。
-- 写库前会先停 `x-ui`，并带 `busy_timeout` 重试，避免 `database is locked (5)`。
+- 写库前用 `systemctl stop x-ui`（3.11.x 无 `x-ui stop/restart` 子命令），sqlite 用 `.timeout` 避免 PRAGMA 回显污染。
 - 装失败半截可直接再跑同一条命令；或先卸干净再装。
 
 ## 重打分享链接
