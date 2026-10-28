@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # One-click 3x-ui + VLESS Reality, IPv4-only (no IPv6).
 # Safe defaults for Dee Panel rental CTs: Reality port != 443/8443/22.
-# Ports: env PANEL_PORT/REALITY_PORT, or --panel-port / --reality-port (flags win).
-# rev: 2026-10-28-ports
+# Ports: interactive prompt via /dev/tty (curl|bash safe); env/flags = non-interactive override.
+# rev: 2026-10-28-ports-ask
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
@@ -11,8 +11,12 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 die()  { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
 
 # ---------- defaults / flags ----------
-# Env works with: curl ... | PANEL_PORT=N REALITY_PORT=M bash
-# Flags override env when both are set.
+# Explicit env/flags skip the interactive prompt (non-interactive override).
+# curl|bash: stdin is the script; prompts MUST use /dev/tty.
+PANEL_EXPLICIT=0
+REALITY_EXPLICIT=0
+if [[ -n "${PANEL_PORT+x}" ]]; then PANEL_EXPLICIT=1; fi
+if [[ -n "${REALITY_PORT+x}" ]]; then REALITY_EXPLICIT=1; fi
 PANEL_PORT="${PANEL_PORT:-2096}"
 REALITY_PORT="${REALITY_PORT:-2087}"
 SNI="${SNI:-www.apple.com}"
@@ -26,14 +30,25 @@ DRY_RUN=0
 FORCE=0
 
 # Incus / Dee Panel rental CT reserved (do not bind)
-RESERVED_PORTS=(22 8443)
+RESERVED_PORTS=(22 443 8443)
+
+is_reserved_port() {
+  local p="$1" r
+  for r in "${RESERVED_PORTS[@]}"; do
+    [[ "$p" -eq "$r" ]] && return 0
+  done
+  return 1
+}
 
 usage() {
   cat <<EOF
 Usage: $0 [options]
 
-  --panel-port N     面板端口 (default: ${PANEL_PORT}; env PANEL_PORT)
-  --reality-port N   Reality 入站端口 (default: ${REALITY_PORT}; env REALITY_PORT)
+一键安装（推荐）会经 /dev/tty 询问面板/Reality 端口；直接回车用默认 2096 / 2087。
+无终端时自动用默认。也可用环境变量或参数跳过询问（非交互覆盖）。
+
+  --panel-port N     面板端口 (default: 2096; env PANEL_PORT；设了则不再询问)
+  --reality-port N   Reality 入站端口 (default: 2087; env REALITY_PORT)
                      禁止 22/443/8443（租用节点保留）
   --sni HOST         Reality 伪装目标 (default: ${SNI})
   --xray-ver VER     Xray 版本号，无 v 前缀 (default: ${XRAY_VER})
@@ -46,17 +61,14 @@ Usage: $0 [options]
   --dry-run          只打印将要执行的步骤，不改系统
   -h, --help         帮助
 
-环境变量（curl|bash 时写在管道右侧）: PANEL_PORT REALITY_PORT SNI XRAY_VER …
-例: curl -fsSL …/install-3xui-ipv4.sh | PANEL_PORT=12345 REALITY_PORT=23456 bash
-
 全程纯 IPv4：关 sysctl IPv6、gai 优先 v4、xray UseIPv4、链接只用 IPv4 字面量。
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --panel-port) PANEL_PORT="$2"; shift 2 ;;
-    --reality-port) REALITY_PORT="$2"; shift 2 ;;
+    --panel-port) PANEL_PORT="$2"; PANEL_EXPLICIT=1; shift 2 ;;
+    --reality-port) REALITY_PORT="$2"; REALITY_EXPLICIT=1; shift 2 ;;
     --sni) SNI="$2"; shift 2 ;;
     --xray-ver) XRAY_VER="${2#v}"; shift 2 ;;
     --xui-tag) XUI_TAG="$2"; shift 2 ;;
@@ -74,25 +86,110 @@ done
 if [[ "$DRY_RUN" -ne 1 ]]; then
   [[ $EUID -eq 0 ]] || die "请用 root 运行"
 fi
-[[ "$PANEL_PORT" =~ ^[0-9]+$ ]] && (( PANEL_PORT >= 1 && PANEL_PORT <= 65535 )) || die "非法 panel-port: $PANEL_PORT"
-[[ "$REALITY_PORT" =~ ^[0-9]+$ ]] && (( REALITY_PORT >= 1 && REALITY_PORT <= 65535 )) || die "非法 reality-port: $REALITY_PORT"
-is_reserved_port() {
-  local p="$1" r
-  for r in "${RESERVED_PORTS[@]}"; do
-    [[ "$p" -eq "$r" ]] && return 0
-  done
-  return 1
+
+# Validate one port; print reason to stdout on failure (caller decides tty vs die).
+port_validate_msg() {
+  local p="$1" label="$2"
+  if ! [[ "$p" =~ ^[0-9]+$ ]]; then
+    echo "${label}须为数字"
+    return 1
+  fi
+  if (( p < 1 || p > 65535 )); then
+    echo "${label}超出范围 1-65535"
+    return 1
+  fi
+  if is_reserved_port "$p"; then
+    echo "${label}不能使用 ${p}（禁止: 22 / 443 / 8443）"
+    return 1
+  fi
+  return 0
 }
-if is_reserved_port "$PANEL_PORT"; then
-  die "面板端口 ${PANEL_PORT} 为系统保留（禁止: ${RESERVED_PORTS[*]}），请换其它端口（默认 2096）"
+
+# Ask one port on /dev/tty (empty = keep default). Echoes chosen value on stdout.
+ask_one_port() {
+  local label="$1" current="$2" ans msg
+  while true; do
+    printf '%s [%s]: ' "$label" "$current" >/dev/tty
+    IFS= read -r ans </dev/tty || ans=""
+    # trim whitespace
+    ans="${ans#"${ans%%[![:space:]]*}"}"
+    ans="${ans%"${ans##*[![:space:]]}"}"
+    if [[ -z "$ans" ]]; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+    if msg=$(port_validate_msg "$ans" "$label"); then
+      printf '%s\n' "$ans"
+      return 0
+    fi
+    printf '%s；请重试（直接回车用默认）\n' "$msg" >/dev/tty
+  done
+}
+
+have_tty() {
+  # inode -r/-w on /dev/tty can look writable even with no controlling tty;
+  # actually open it (ENXIO when none).
+  { : </dev/tty; } 2>/dev/null && { : >/dev/tty; } 2>/dev/null
+}
+
+prompt_ports_interactive() {
+  # Skip entirely if both ports already set via env/flags.
+  if [[ "$PANEL_EXPLICIT" -eq 1 && "$REALITY_EXPLICIT" -eq 1 ]]; then
+    return 0
+  fi
+  if ! have_tty; then
+    warn "无 /dev/tty（非交互），使用默认端口 panel=${PANEL_PORT} reality=${REALITY_PORT}"
+    return 0
+  fi
+  {
+    echo
+    echo "======== 端口设置（直接回车 = 默认）========"
+    echo "禁止占用: 22 / 443 / 8443（租用节点保留）"
+    echo "=========================================="
+  } >/dev/tty
+
+  if [[ "$PANEL_EXPLICIT" -eq 0 ]]; then
+    PANEL_PORT="$(ask_one_port "面板端口" "$PANEL_PORT")"
+  fi
+  if [[ "$REALITY_EXPLICIT" -eq 0 ]]; then
+    REALITY_PORT="$(ask_one_port "Reality端口" "$REALITY_PORT")"
+  fi
+
+  # Duplicate: re-ask the non-explicit side; if both explicit, die later in validate.
+  while [[ "$PANEL_PORT" -eq "$REALITY_PORT" ]]; do
+    if [[ "$PANEL_EXPLICIT" -eq 1 && "$REALITY_EXPLICIT" -eq 1 ]]; then
+      break
+    fi
+    printf '面板与 Reality 端口不能相同（当前都是 %s）\n' "$PANEL_PORT" >/dev/tty
+    if [[ "$REALITY_EXPLICIT" -eq 0 ]]; then
+      REALITY_PORT="$(ask_one_port "Reality端口" "2087")"
+    elif [[ "$PANEL_EXPLICIT" -eq 0 ]]; then
+      PANEL_PORT="$(ask_one_port "面板端口" "2096")"
+    else
+      break
+    fi
+  done
+  printf '将使用: 面板=%s  Reality=%s\n\n' "$PANEL_PORT" "$REALITY_PORT" >/dev/tty
+}
+
+validate_ports_final() {
+  local msg
+  if ! msg=$(port_validate_msg "$PANEL_PORT" "面板端口"); then
+    die "$msg（默认 2096）"
+  fi
+  if ! msg=$(port_validate_msg "$REALITY_PORT" "Reality端口"); then
+    die "$msg（默认 2087）"
+  fi
+  if [[ "$PANEL_PORT" -eq "$REALITY_PORT" ]]; then
+    die "面板端口与 Reality 端口不能相同"
+  fi
+}
+
+prompt_ports_interactive
+validate_ports_final
+if [[ "$SNI" == *:* ]]; then
+  die "SNI 不要带端口，例如 www.apple.com"
 fi
-if is_reserved_port "$REALITY_PORT"; then
-  die "Reality 端口 ${REALITY_PORT} 为系统保留（禁止: ${RESERVED_PORTS[*]}），请换其它端口（默认 2087）"
-fi
-[[ "$REALITY_PORT" -eq 443 ]] && die "Reality 端口禁止使用 443（直连高位端口；默认 2087）"
-[[ "$PANEL_PORT" -eq 443 ]] && die "面板端口不要用 443（默认 2096）"
-[[ "$PANEL_PORT" -eq "$REALITY_PORT" ]] && die "面板端口与 Reality 端口不能相同"
-[[ "$SNI" == *:* ]] && die "SNI 不要带端口，例如 www.apple.com"
 
 rand_alnum() {
   local n="${1:-16}"
